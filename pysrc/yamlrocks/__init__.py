@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from typing import Any
 
 from yamlrocks._yamlrocks import (
@@ -424,7 +424,7 @@ def _read_source(source: Any) -> tuple[bytes | str, str | None]:
 
 
 @contextlib.contextmanager
-def _origin(path: str | None) -> Iterator[None]:
+def _origin(path: str | None) -> Generator[None]:
     """Tag any raised ``YAMLRocksError`` with the source file when it has none.
 
     The Rust core only sees bytes, so it cannot know the path a file was read
@@ -491,7 +491,7 @@ def load_all(
     tag_handler: Callable[[str, Any], Any] | None = None,
     tags: dict[str, Callable[[Any], Any]] | None = None,
 ) -> list[Any]:
-    """Parse every document from a path or file-like object into a list."""
+    """Parse every document into a list; OPT_ROUND_TRIP returns document objects."""
     data, _ = _read_source(source)
     origin = None if hasattr(source, "read") else os.fspath(source)
     with _origin(origin):
