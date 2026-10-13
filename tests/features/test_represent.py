@@ -13,6 +13,8 @@ import dataclasses
 import datetime
 import decimal
 import enum
+import sys
+import sysconfig
 
 import pytest
 
@@ -29,6 +31,27 @@ def _deep_dict(depth: int) -> dict:
         cursor = child
     cursor["k"] = "leaf"
     return doc
+
+
+# The represent lowering re-enters Python at every level, so how deep it can go
+# depends on the thread's stack (a clean depth error past that), and the deep-
+# nesting tests stay well under each platform's ceiling:
+#
+# - CPython on musl budgets a fixed C stack of about 1 MB instead of asking the
+#   OS, so the lowering tops out near 275 levels there.
+# - On 64-bit Windows, CPython 3.12 tops out just above 500 levels (later
+#   versions near 760). A depth of 500 left almost no margin, so any change that
+#   grew the recursion frame by a few bytes failed there.
+#
+# Everywhere else the 1000-level cap applies.
+_ON_MUSL = "musl" in (sysconfig.get_config_var("HOST_GNU_TYPE") or "")
+_ON_WINDOWS_312 = sys.platform == "win32" and sys.version_info[:2] == (3, 12)
+if _ON_MUSL:
+    _DEEP_REPRESENT = 250
+elif _ON_WINDOWS_312:
+    _DEEP_REPRESENT = 400
+else:
+    _DEEP_REPRESENT = 500
 
 
 def test_scalar_with_custom_tag_forces_single_quotes():
@@ -168,7 +191,7 @@ def test_deferred_non_first_tagged_key_uses_explicit_form():
 
 def test_deeply_nested_represent_tree_tears_down_without_overflow():
     """A deeply nested synthetic tree emits and is dismantled iteratively."""
-    doc = _deep_dict(500)
+    doc = _deep_dict(_DEEP_REPRESENT)
     out = yamlrocks.dumps(doc, represent=lambda _: None)
     assert yamlrocks.loads(out) is not None
 
@@ -188,19 +211,38 @@ def test_represent_deep_nesting_raises_cleanly():
         yamlrocks.dumps(deep, represent=lambda _: None)
 
 
+def test_represent_recursion_error_becomes_depth_error():
+    """A ``RecursionError`` escaping the lowering is raised as the depth error, chained to the original."""
+
+    def represent(_value):
+        raise RecursionError("C stack budget exhausted")
+
+    with pytest.raises(
+        yamlrocks.YAMLRocksUnserializableError, match="too deeply nested"
+    ) as caught:
+        yamlrocks.dumps({"a": 1}, represent=represent)
+    assert isinstance(caught.value.__cause__, RecursionError)
+
+
 def test_mapping_error_after_deep_value_tears_down_iteratively():
     """A mapping lowering error dismantles the already-built pairs iteratively."""
     # `object()` has no scalar rendering and no `default`, so lowering "bad" fails
     # after "deep" is already built.
-    doc = {"deep": _deep_dict(300), "bad": object()}
-    with pytest.raises(yamlrocks.YAMLRocksEncodeError):
+    doc = {"deep": _deep_dict(_DEEP_REPRESENT // 2), "bad": object()}
+    with pytest.raises(
+        yamlrocks.YAMLRocksUnserializableError, match="not YAML serializable"
+    ):
         yamlrocks.dumps(doc, represent=lambda _: None)
 
 
 def test_sequence_error_after_deep_item_tears_down_iteratively():
     """The sequence path likewise dismantles already-built items iteratively when a later item fails to lower."""
-    with pytest.raises(yamlrocks.YAMLRocksEncodeError):
-        yamlrocks.dumps([_deep_dict(300), object()], represent=lambda _: None)
+    with pytest.raises(
+        yamlrocks.YAMLRocksUnserializableError, match="not YAML serializable"
+    ):
+        yamlrocks.dumps(
+            [_deep_dict(_DEEP_REPRESENT // 2), object()], represent=lambda _: None
+        )
 
 
 def test_explicit_block_style_rejects_lossy_values():
@@ -249,7 +291,7 @@ def test_default_self_reference_after_deep_subtree_raises_cleanly():
     box = Box()
 
     def default(obj):
-        return {"deep": _deep_dict(300), "self": obj}
+        return {"deep": _deep_dict(_DEEP_REPRESENT // 2), "self": obj}
 
     with pytest.raises(ValueError, match="refers only to itself"):
         yamlrocks.dumps(box, default=default, represent=lambda _: None)
@@ -827,13 +869,47 @@ def test_deferred_root_tagged_collection_indents_under_tag():
     )
 
 
-def test_width_with_represent_raises():
-    """`width` line-wrapping is not implemented on the represent path."""
-    with pytest.raises(ValueError, match="width is not supported"):
-        yamlrocks.dumps({"k": "x" * 200}, width=80, represent=lambda _: None)
+def test_width_with_represent():
+    """The represent path honors width without changing the decoded value."""
+    data = {"k": "some words that should wrap over several lines"}
+    output = yamlrocks.dumps(data, width=16, represent=lambda _: None)
+    assert len(output.splitlines()) > 1
+    assert yamlrocks.loads(output) == data
 
 
-# --- Regressions from the pre-merge audit rounds ---
+@pytest.mark.parametrize("width", [8, 20, 80])
+@pytest.mark.parametrize(
+    "option_name", ["default", "flow", "single_quotes", "indent_4"]
+)
+def test_deferred_output_matches_plain_dumps_with_width(option_name, width):
+    """With ``width``, a fully deferred callback still reproduces plain dumps byte-for-byte."""
+    option = _PARITY_OPTIONS[option_name]
+    long_values = [
+        "some words that should wrap over several lines and then some more",
+        ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"],
+        {"nested": "a long sentence with many words in it to be wrapped"},
+    ]
+    for base in [*_parity_bases(), *long_values]:
+        try:
+            hash(base)
+            hashable = True
+        except TypeError:
+            hashable = False
+        for doc in _parity_positions(base, hashable):
+            plain = yamlrocks.dumps(doc, option=option, width=width)
+            try:
+                deferred = yamlrocks.dumps(
+                    doc, option=option, width=width, represent=lambda _: None
+                )
+            except ValueError as err:
+                # The accepted shared-tagged-value divergence, as above.
+                if "shared value" in str(err):
+                    continue
+                raise
+            # The accepted aliasing divergence, as above.
+            if b"&id" in deferred and b"&id" not in plain:
+                continue
+            assert deferred == plain, f"{base!r} in {doc!r} [{option_name}, {width}]"
 
 
 def test_alias_as_mapping_key_reloads():
