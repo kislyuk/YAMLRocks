@@ -109,6 +109,26 @@ yamlrocks.loads_all(source)
 # [{'a': 1}, {'b': 2}]
 ```
 
+With `OPT_ROUND_TRIP`, every entry is an independent
+[`YAMLRocksDocument`](#yamlrocksdocument). Each one keeps its own comments,
+anchors, and `%YAML` version, and editing one leaves the others alone. An
+explicit empty document (a bare `---`) is kept as a null document. Joining the
+`to_yaml()` output of the unedited documents reproduces the original stream. A
+stream with no documents at all (only comments) returns an empty list, as it
+does without `OPT_ROUND_TRIP`, so those comments are not kept; `loads` with
+`OPT_ROUND_TRIP` keeps them.
+
+```python
+import yamlrocks
+
+docs = yamlrocks.loads_all(
+    b"name: app\n---\nport: 8080  # default\n", option=yamlrocks.OPT_ROUND_TRIP
+)
+docs[1]["port"] = 9090
+docs[1].to_yaml()
+# b'---\nport: 9090  # default\n'
+```
+
 ### `load`
 
 ```python
@@ -475,6 +495,7 @@ to serialize.
 | Member                    | Description                                                                                             |
 | ------------------------- | ------------------------------------------------------------------------------------------------------- |
 | `origin: str \| None`     | The path the document was loaded from, or `None`.                                                       |
+| `explicit_start: bool`    | Whether the document began with an explicit `---` marker. Read-only.                                    |
 | `__len__()`               | Number of top-level entries.                                                                            |
 | `__getitem__(key)`        | Read a value. A nested mapping or sequence returns a [`YAMLRocksDocumentView`](#yamlrocksdocumentview). |
 | `__setitem__(key, value)` | Set a value; the change is reflected by `to_yaml`.                                                      |
@@ -490,6 +511,7 @@ to serialize.
 | `walk()`                  | List of `(path_tuple, value)` pairs for every leaf.                                                     |
 | `locate(path)`            | The [`YAMLRocksNode`](#yamlrocksnode) at a data path (scalar leaves included), or `None` if unresolved. |
 | `node`                    | The root [`YAMLRocksNode`](#yamlrocksnode) cursor for metadata access (comments, location, style).      |
+| `to_tree()`               | An immutable [`YAMLRocksTreeNode`](#yamlrockstreenode) snapshot of the whole tree, or `None` if empty.  |
 | `anchors`                 | `dict[str, YAMLRocksNode]` mapping each anchor name to its defining [`YAMLRocksNode`](#yamlrocksnode).  |
 
 ```python
@@ -600,6 +622,45 @@ doc.to_yaml()
 # b'server:\n  port: 8443 # now uses TLS\n'
 ```
 
+### `YAMLRocksTreeNode`
+
+An immutable snapshot returned by `YAMLRocksDocument.to_tree()`, holding every
+node's value and presentation metadata at once. Where a
+[`YAMLRocksNode`](#yamlrocksnode) cursor looks its node up from the root on each
+access, a snapshot owns its children, so walking a large document is a single
+pass. Each node reports the same comments, style, tag, and anchor a cursor at
+that position does. The snapshot does not change when the document is edited
+afterwards.
+
+| Member           | Description                                                                                                                |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `kind`           | `scalar`, `sequence`, `mapping`, or `alias`.                                                                               |
+| `value`          | A scalar's resolved Python value, a tuple of child nodes, a tuple of `(key, value)` node pairs, or an alias's anchor name. |
+| `comment`        | Inline comment trailing the value, bare of `#`, or `None`.                                                                 |
+| `comment_before` | Standalone comment line(s) above the node, or `None`. For a mapping value, the comment above its key.                      |
+| `comment_after`  | Trailing comment block after a block collection or the document root, or `None`.                                           |
+| `style`          | `plain`, `single`, `double`, `literal`, `folded`, `block`, `flow`, `alias`, or `null`.                                     |
+| `anchor`         | Anchor name (`&name`), or `None`.                                                                                          |
+| `tag`            | Explicit tag (`!!str`, `!custom`), or `None`.                                                                              |
+| `is_merge_key`   | `True` for a plain `<<` merge key. A quoted `"<<"` is an ordinary key.                                                     |
+
+Aliases and merge keys are kept as written, so the caller decides whether to
+expand them. A document wrapping several documents raises `ValueError`; load
+those with [`loads_all`](#loads_all) and `OPT_ROUND_TRIP` to get one document each.
+
+```python
+import yamlrocks
+
+doc = yamlrocks.loads(
+    b"# the service\nname: app\nports: [80, 443]\n", option=yamlrocks.OPT_ROUND_TRIP
+)
+(name_key, name), (_, ports) = doc.to_tree().value
+(name_key.value, name.value, name.comment_before)
+# ('name', 'app', 'the service')
+(ports.style, [port.value for port in ports.value])
+# ('flow', [80, 443])
+```
+
 ### `YAMLRocksAnnotatedDict` / `YAMLRocksAnnotatedList` / `YAMLRocksAnnotatedStr`
 
 Returned by `loads`/`load` with `OPT_ANNOTATED`. These subclass the matching
@@ -665,28 +726,69 @@ See the [custom tags guide](/guides/tags/).
 ### `YAMLRocksScalar`
 
 A node descriptor returned by a [`dumps`](#dumps) `represent` callback to emit a
-value as a scalar. `YAMLRocksScalar(value, *, tag=None, style="auto")`.
+value as a scalar. `YAMLRocksScalar(value, *, tag=None, style="auto",
+comment=None, comment_before=None, comment_after=None)`.
 
-| Member             | Description                                                                                       |
-| ------------------ | ------------------------------------------------------------------------------------------------- |
-| `value: str`       | The scalar text to emit.                                                                          |
-| `tag: str \| None` | An optional explicit tag (including its leading `!`).                                             |
-| `style: str`       | `"auto"` (let the emitter choose), `"plain"`, `"single"`, `"double"`, `"literal"`, or `"folded"`. |
+| Member                                       | Description                                                                                       |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `value: str`                                 | The scalar text to emit.                                                                          |
+| `tag: str \| None`                           | An optional explicit tag (including its leading `!`).                                             |
+| `style: str`                                 | `"auto"` (let the emitter choose), `"plain"`, `"single"`, `"double"`, `"literal"`, or `"folded"`. |
+| `comment`, `comment_before`, `comment_after` | Optional comments; see [comments on descriptors](#comments-on-descriptors).                       |
+
+#### Comments on descriptors
+
+All three descriptors accept the keyword-only `comment`, `comment_before`, and
+`comment_after` arguments, and expose them as read-only properties. They follow
+the same rules as the [`YAMLRocksNode`](#yamlrocksnode) comment properties, so
+comments land where they would after loading and editing a document:
+
+- The text is bare, without the leading `#`.
+- `comment` is the inline comment after the value. It must be a single line;
+  a line break raises `ValueError`.
+- `comment_before` is the comment above the node. For a mapping value it
+  renders above the key. It can span several lines.
+- `comment_after` is the comment block after a block mapping or sequence, or
+  at the end of the document for the root. Anywhere else there is no place to
+  render it, so it raises `ValueError`.
+- A mapping key must stay on one line, so a key accepts only `comment_before`.
+- Inside a flow collection, comments put each entry on its own line.
+
+```python
+import yamlrocks
+
+S = yamlrocks.YAMLRocksScalar
+
+
+def represent(value):
+    return value if isinstance(value, S) else None
+
+
+yamlrocks.dumps(
+    {"name": S("app", comment="the service name", comment_before="Service")},
+    represent=represent,
+)
+# b'# Service\nname: app # the service name\n'
+```
 
 ### `YAMLRocksSequence`
 
 A node descriptor returned by a `represent` callback to emit a value as a
-sequence. `YAMLRocksSequence(items, *, tag=None, flow=None)`. `items` is an
+sequence. `YAMLRocksSequence(items, *, tag=None, flow=None, comment=None,
+comment_before=None, comment_after=None)`. `items` is an
 iterable of host objects, each re-dispatched through `represent`; `flow=True`
-forces flow (`[a, b]`) style. See
+forces flow (`[a, b]`) style. The comment arguments work as for
+[`YAMLRocksScalar`](#comments-on-descriptors). See
 [full control with `represent`](/guides/dumping/#full-control-with-represent).
 
 ### `YAMLRocksMapping`
 
 A node descriptor returned by a `represent` callback to emit a value as a
-mapping. `YAMLRocksMapping(pairs, *, tag=None, flow=None)`. `pairs` is an
-iterable of `(key, value)` tuples, each re-dispatched through `represent`;
-`flow=True` forces flow (`{a: b}`) style.
+mapping. `YAMLRocksMapping(pairs, *, tag=None, flow=None, comment=None,
+comment_before=None, comment_after=None)`. `pairs` is an iterable of
+`(key, value)` tuples, each re-dispatched through `represent`; `flow=True`
+forces flow (`{a: b}`) style. The comment arguments work as for
+[`YAMLRocksScalar`](#comments-on-descriptors).
 
 ### `YAMLRocksTags`
 

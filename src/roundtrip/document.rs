@@ -340,6 +340,13 @@ impl YAMLRocksDocument {
         }
     }
 
+    /// Whether the first document used an explicit `---` start marker.
+    /// Read directly from the parsed tree, including before any edits.
+    #[getter]
+    fn explicit_start(&self) -> bool {
+        self.nodes.first().is_some_and(|node| node.explicit_start)
+    }
+
     /// The root [`YAMLRocksNode`] cursor: a metadata-bearing handle from which any node
     /// in the tree can be reached by indexing (`doc.node["server"]["port"]`).
     /// Unlike item access, indexing a `YAMLRocksNode` always yields another `YAMLRocksNode`, so
@@ -379,6 +386,20 @@ impl YAMLRocksDocument {
             dict.set_item(name, node)?;
         }
         Ok(dict.into_any().unbind())
+    }
+
+    /// Snapshot one document's values and metadata in a single tree traversal.
+    /// Empty input returns None; use `loads_all` for a multi-document stream.
+    fn to_tree(&self, py: Python<'_>) -> PyResult<Option<Py<super::tree::YAMLRocksTreeNode>>> {
+        if self.nodes.len() > 1 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "to_tree() requires one document; use loads_all(option=OPT_ROUND_TRIP)",
+            ));
+        }
+        self.nodes
+            .first()
+            .map(|node| super::tree::snapshot(py, node, self.schema, self.resolve_timestamps))
+            .transpose()
     }
 
     /// Return the document as plain Python objects (a resolved snapshot).
@@ -974,6 +995,7 @@ impl YAMLRocksNode {
     /// the `key:`/`-` when the value is a block written on the lines below.
     #[setter]
     fn set_comment(&self, py: Python<'_>, text: Option<String>) -> PyResult<()> {
+        let text = inline_comment_text(text)?;
         let mut doc = self.root.borrow_mut(py);
         let node = resolve_path_mut(&mut doc.nodes, &self.path).ok_or_else(stale_node)?;
         node.comments.inline = text;
@@ -995,25 +1017,7 @@ impl YAMLRocksNode {
     fn comment_before(&self, py: Python<'_>) -> PyResult<Option<String>> {
         let doc = self.root.borrow(py);
         let (node, scope) = resolve_head(&doc.nodes, &self.path).ok_or_else(stale_node)?;
-        let lines: Vec<String> = match scope {
-            HeadScope::All => node
-                .comments
-                .head
-                .iter()
-                .map(|comment| comment.text.to_string())
-                .collect(),
-            HeadScope::AboveDash => node
-                .comments
-                .head_above_introducer()
-                .map(str::to_owned)
-                .collect(),
-            HeadScope::BelowDash => node
-                .comments
-                .head_below_introducer()
-                .map(str::to_owned)
-                .collect(),
-        };
-        Ok(join_comment_lines(&lines))
+        Ok(head_comment_text(node, scope))
     }
 
     /// Set or clear the standalone comment above this node. A multi-line string
@@ -1035,7 +1039,7 @@ impl YAMLRocksNode {
                 .cloned()
                 .collect(),
         };
-        let written = split_comment_lines(text)
+        let written = split_comment_lines(text)?
             .into_iter()
             .map(|text| HeadComment {
                 text: text.into_boxed_str(),
@@ -1084,7 +1088,7 @@ impl YAMLRocksNode {
                  sequence, or the document root",
             ));
         }
-        node.comments.foot = split_comment_lines(text);
+        node.comments.foot = split_comment_lines(text)?;
         node.mark_modified();
         Ok(())
     }
@@ -1367,7 +1371,7 @@ fn stale_node() -> PyErr {
 }
 
 /// The presentation-style name reported by `YAMLRocksNode.style`.
-fn node_style_name(node: &YamlNode) -> &'static str {
+pub(crate) fn node_style_name(node: &YamlNode) -> &'static str {
     match &node.kind {
         YamlNodeKind::Scalar(_, style) => style.name(),
         YamlNodeKind::Mapping(_) | YamlNodeKind::Sequence(_) => match node.style {
@@ -1379,6 +1383,30 @@ fn node_style_name(node: &YamlNode) -> &'static str {
     }
 }
 
+/// The `comment_before` text stored on `node` for the part `scope` addresses,
+/// or `None`. The single definition shared by the cursor and the tree snapshot.
+pub(crate) fn head_comment_text(node: &YamlNode, scope: HeadScope) -> Option<String> {
+    let lines: Vec<String> = match scope {
+        HeadScope::All => node
+            .comments
+            .head
+            .iter()
+            .map(|comment| comment.text.to_string())
+            .collect(),
+        HeadScope::AboveDash => node
+            .comments
+            .head_above_introducer()
+            .map(str::to_owned)
+            .collect(),
+        HeadScope::BelowDash => node
+            .comments
+            .head_below_introducer()
+            .map(str::to_owned)
+            .collect(),
+    };
+    join_comment_lines(&lines)
+}
+
 /// Join stored comment lines (text without `#`) for return to Python.
 fn join_comment_lines(lines: &[String]) -> Option<String> {
     if lines.is_empty() {
@@ -1388,19 +1416,54 @@ fn join_comment_lines(lines: &[String]) -> Option<String> {
     }
 }
 
-/// Split a user-supplied comment string into stored lines (one per line).
-fn split_comment_lines(text: Option<String>) -> Vec<String> {
-    match text {
-        None => Vec::new(),
-        Some(s) => s.split('\n').map(|line| line.to_owned()).collect(),
+/// The line breaks only a YAML 1.1 reader honors (NEL, LS, PS). This library
+/// does not break lines on them, but PyYAML does, so one inside a comment would
+/// end it there and turn the rest of the text into document content.
+const YAML_11_LINE_BREAKS: [char; 3] = ['\u{85}', '\u{2028}', '\u{2029}'];
+
+/// Validate a user-supplied inline comment. It must stay on one line: a line
+/// break would end the comment and emit the rest as document content (`k: v #
+/// a\nnot: comment` adds a `not` key), so any break is a `ValueError`.
+pub(crate) fn inline_comment_text(text: Option<String>) -> PyResult<Option<String>> {
+    let has_break = text
+        .as_deref()
+        .is_some_and(|text| text.contains(['\n', '\r']) || text.contains(YAML_11_LINE_BREAKS));
+    if has_break {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "an inline comment cannot contain a line break; use comment_before or \
+             comment_after for a multi-line comment",
+        ));
     }
+    Ok(text)
+}
+
+/// Split a user-supplied comment string into stored lines, one per line. Every
+/// YAML line break separates lines (`\r\n`, a lone `\r`, and `\n`), so none can
+/// survive inside a line and turn the rest of it into document content. The
+/// YAML 1.1-only breaks are rejected rather than guessed at.
+pub(crate) fn split_comment_lines(text: Option<String>) -> PyResult<Vec<String>> {
+    let Some(text) = text else {
+        return Ok(Vec::new());
+    };
+
+    if text.contains(YAML_11_LINE_BREAKS) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "a comment cannot contain NEL, LS, or PS line breaks; use \\n to \
+             separate comment lines",
+        ));
+    }
+    Ok(text
+        .replace("\r\n", "\n")
+        .split(['\n', '\r'])
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Whether the emitter renders a node's foot comment in place: only after a
 /// non-empty block mapping or sequence (an empty or flow collection emits inline
 /// with no foot position). The document root is handled separately by its caller,
 /// since its foot renders for any node kind.
-fn renders_foot(node: &YamlNode) -> bool {
+pub(crate) fn renders_foot(node: &YamlNode) -> bool {
     if node.style != NodeStyle::Block {
         return false;
     }
@@ -1428,7 +1491,7 @@ fn renders_foot(node: &YamlNode) -> bool {
 /// inside it, directly above its first key. The two are stored together, so the
 /// cursor decides which of them it means.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum HeadScope {
+pub(crate) enum HeadScope {
     /// The whole block: a mapping's leading comments, a key node's own, or the
     /// document root's. Nothing divides these.
     All,
@@ -1479,15 +1542,26 @@ fn resolve_head<'a>(roots: &'a [YamlNode], path: &[PathSeg]) -> Option<(&'a Yaml
 /// they are the lines below that comment; with no dash comment there is nothing
 /// dividing the block, and the whole of it sits above the key.
 fn head_scope_of_parent(parent: &[PathSeg], parent_node: &YamlNode) -> HeadScope {
-    match parent.last() {
-        Some(PathSeg::Index(_)) if parent_node.comments.inline_before_value => HeadScope::BelowDash,
-        _ => HeadScope::All,
+    head_scope_of_first_key(
+        parent_node,
+        matches!(parent.last(), Some(PathSeg::Index(_))),
+    )
+}
+
+/// The scope for a mapping's first key, given whether that mapping is itself a
+/// sequence item. Shared by the path-based cursor and the tree snapshot, which
+/// knows the parent while it walks.
+pub(crate) fn head_scope_of_first_key(mapping: &YamlNode, is_sequence_item: bool) -> HeadScope {
+    if is_sequence_item && mapping.comments.inline_before_value {
+        HeadScope::BelowDash
+    } else {
+        HeadScope::All
     }
 }
 
 /// The scope for a cursor addressing a sequence item itself. Without a comment
 /// on its dash there is no dividing line, so the item owns its whole block.
-fn head_scope_of_item(item: &YamlNode) -> HeadScope {
+pub(crate) fn head_scope_of_item(item: &YamlNode) -> HeadScope {
     if item.comments.inline_before_value {
         HeadScope::AboveDash
     } else {
